@@ -38,10 +38,11 @@ import (
 )
 
 const (
-	Interval = 5 * time.Second
+	TickInterval   = 10 * time.Second
+	ReportInterval = 60 * time.Second
 
-	MeasureTemperature = "custom.google.com/temperature"
-	MeasurePressure    = "custom.google.com/pressure"
+	MeasureTemperature = "temperature"
+	MeasurePressure    = "pressure"
 
 	TemperatureUnit = "C"
 	PressureUnit    = "hPa"
@@ -72,30 +73,9 @@ var (
 		TagKeys:     []tag.Key{KeyRainfall},
 		Aggregation: view.LastValue(),
 	}
+
+	Hostname, _ = os.Hostname()
 )
-
-type BMP280Data struct {
-	Temperature float64
-	Pressure    float64
-}
-
-type GenericNodeMonitoredResource struct{}
-
-func (mr *GenericNodeMonitoredResource) MonitoredResource() (string, map[string]string) {
-	labels := map[string]string{
-		"location":  "asia-northeast1-a",
-		"namespace": "ymotongpoo",
-		"node_id":   "hostname",
-	}
-	return "generic_node", labels
-}
-
-func InitHAT() (*rainbowhat.Dev, error) {
-	if _, err := host.Init(); err != nil {
-		log.Fatal(err)
-	}
-	return rainbowhat.NewRainbowHat(&apa102.DefaultOpts)
-}
 
 func main() {
 	hat, err := InitHAT()
@@ -121,49 +101,56 @@ func main() {
 		Location:                "asia-northeast1-a",
 		MonitoredResource:       &GenericNodeMonitoredResource{},
 		DefaultMonitoringLabels: labels,
+		GetMetricType:           GetMetricType,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create Stackdriver exporter: %v\n", err)
 	}
 	defer exporter.Flush()
+	view.SetReportingPeriod(ReportInterval)
 	view.RegisterExporter(exporter)
 	if err := view.Register(TemperatureView, PressureView); err != nil {
 		log.Fatalf("Failed to enable views: %v\n", err)
 	}
 
-	dataCh := loopSensing(hat, sig)
-	for d := range dataCh {
-		if err := recordMeasurement(d); err != nil {
-			log.Fatalf("failed sendind data: %v", err)
+	LoopSensing(hat, sig)
+}
+
+//---- Rainbow HAT ----
+
+type BMP280Data struct {
+	Temperature float64
+	Pressure    float64
+}
+
+func InitHAT() (*rainbowhat.Dev, error) {
+	if _, err := host.Init(); err != nil {
+		log.Fatal(err)
+	}
+	return rainbowhat.NewRainbowHat(&apa102.DefaultOpts)
+}
+
+func LoopSensing(hat *rainbowhat.Dev, sig chan os.Signal) {
+	sensor := hat.GetBmp280()
+	ticker := time.NewTicker(TickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			d, err := GetSensorData(sensor)
+			if err != nil {
+				log.Printf("error on sensing BMP280: %v\n", err)
+				break
+			}
+			err = RecordMeasurement(d)
+		case s := <-sig:
+			fmt.Println(s)
+			os.Exit(0)
 		}
 	}
 }
 
-func loopSensing(hat *rainbowhat.Dev, sig chan os.Signal) <-chan BMP280Data {
-	sensor := hat.GetBmp280()
-	ch := make(chan BMP280Data, 10)
-	go func(chan<- BMP280Data) {
-		ticker := time.NewTicker(Interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				d, err := getSensorData(sensor)
-				if err != nil {
-					log.Printf("error on sensing BMP280: %v\n", err)
-					break
-				}
-				ch <- d
-			case s := <-sig:
-				fmt.Println(s)
-				return
-			}
-		}
-	}(ch)
-	return ch
-}
-
-func getSensorData(sensor *bmxx80.Dev) (BMP280Data, error) {
+func GetSensorData(sensor *bmxx80.Dev) (BMP280Data, error) {
 	var env physic.Env
 	if err := sensor.Sense(&env); err != nil {
 		return BMP280Data{}, err
@@ -175,7 +162,20 @@ func getSensorData(sensor *bmxx80.Dev) (BMP280Data, error) {
 	return d, nil
 }
 
-func recordMeasurement(data BMP280Data) error {
+//---- OpenCensus + Stackdriver ----
+
+type GenericNodeMonitoredResource struct{}
+
+func (mr *GenericNodeMonitoredResource) MonitoredResource() (string, map[string]string) {
+	labels := map[string]string{
+		"location":  "asia-northeast1-a",
+		"namespace": "ymotongpoo",
+		"node_id":   Hostname,
+	}
+	return "generic_node", labels
+}
+
+func RecordMeasurement(data BMP280Data) error {
 	rf, err := fetchRainfall(WeatherLon, WeatherLat)
 	if err != nil {
 		return err
@@ -186,6 +186,10 @@ func recordMeasurement(data BMP280Data) error {
 	}
 	stats.Record(ctx, MTemperature.M(data.Temperature), MPressure.M(data.Pressure))
 	return nil
+}
+
+func GetMetricType(v *view.View) string {
+	return fmt.Sprintf("custom.googleapis.com/%s", v.Name)
 }
 
 //---- rainfall data ----
