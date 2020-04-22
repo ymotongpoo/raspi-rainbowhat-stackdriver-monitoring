@@ -1,5 +1,4 @@
-# raspi-bme280-go
-
+# raspi-rainbowhat-stackdriver-monitoring
 This sample fetches temperature and pressure from BMP280 on Rainbow HAT,
 and sends those data to Stackdriver Monitoring via OpenCensus.
 
